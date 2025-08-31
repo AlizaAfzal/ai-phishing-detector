@@ -652,6 +652,25 @@ def api_logout():
     session.clear()
     return jsonify({"message": "Logged out successfully"}), 200
 
+# Health check endpoint for deployment monitoring
+@app.route('/health')
+def health_check():
+    try:
+        # Test database connection
+        db = client.get_database()
+        db.admin.command('ping')
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return {
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'database': db_status,
+        'huggingface_key': 'configured' if HUGGINGFACE_API_KEY and HUGGINGFACE_API_KEY != 'your_huggingface_api_key_here' else 'not_configured',
+        'email_configured': 'yes' if EMAIL_ADDRESS and EMAIL_PASSWORD else 'no'
+    }
+
 # Initialize comprehensive analyzer
 comprehensive_analyzer = ComprehensiveEmailAnalyzer(HUGGINGFACE_API_KEY, HUGGINGFACE_API_URL)
 
