@@ -21,32 +21,52 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
 
 # MongoDB configuration
-app.config["MONGO_URI"] = os.getenv('MONGO_URI', 'mongodb://localhost:27017/mailguard')
-mongo = PyMongo(app)
+mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017/mailguard')
+app.config["MONGO_URI"] = mongo_uri
 
-# Test MongoDB connection
+# Initialize MongoDB with better error handling
 try:
+    mongo = PyMongo(app)
+    # Test the connection
     mongo.db.command('ping')
     print("✅ MongoDB connected successfully")
+    print(f"📊 Database: {mongo.db.name}")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
     print("⚠️ Using in-memory storage for development")
+    print("💡 To use MongoDB, either:")
+    print("   1. Install MongoDB locally: https://docs.mongodb.com/manual/installation/")
+    print("   2. Use MongoDB Atlas: https://cloud.mongodb.com/")
+    print("   3. Set MONGO_URI environment variable")
+    
     # Create a simple in-memory storage for development
     class MockDB:
         def __init__(self):
             self.users = {}
             self.detections = []
+            self._id_counter = 1
         
         def insert_one(self, data):
             if 'username' in data:
+                data['_id'] = f"mock_{self._id_counter}"
                 self.users[data['username']] = data
             else:
+                data['_id'] = f"mock_{self._id_counter}"
                 self.detections.append(data)
-            return type('obj', (object,), {'inserted_id': 'mock_id'})()
+            self._id_counter += 1
+            return type('obj', (object,), {'inserted_id': data['_id']})()
         
         def find_one(self, query):
             if 'username' in query:
                 return self.users.get(query['username'])
+            elif '_id' in query:
+                # Search in both users and detections
+                for user in self.users.values():
+                    if user.get('_id') == query['_id']:
+                        return user
+                for detection in self.detections:
+                    if detection.get('_id') == query['_id']:
+                        return detection
             return None
         
         def update_one(self, query, update):
@@ -58,7 +78,47 @@ except Exception as e:
                     if '$unset' in update:
                         for key in update['$unset']:
                             self.users[username].pop(key, None)
+            elif '_id' in query:
+                # Update by _id
+                for user in self.users.values():
+                    if user.get('_id') == query['_id']:
+                        if '$set' in update:
+                            user.update(update['$set'])
+                        if '$unset' in update:
+                            for key in update['$unset']:
+                                user.pop(key, None)
+                        break
             return type('obj', (object,), {'modified_count': 1})()
+        
+        def delete_one(self, query):
+            if 'username' in query:
+                username = query['username']
+                if username in self.users:
+                    del self.users[username]
+            return type('obj', (object,), {'deleted_count': 1})()
+        
+        def find(self, query=None, **kwargs):
+            if query is None:
+                query = {}
+            
+            results = []
+            if 'username' in query:
+                user = self.users.get(query['username'])
+                if user:
+                    results.append(user)
+            else:
+                # Return all detections for analysis history
+                results = self.detections.copy()
+            
+            # Sort by timestamp if available
+            if 'timestamp' in kwargs.get('sort', []):
+                results.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            
+            # Limit results
+            if 'limit' in kwargs:
+                results = results[:kwargs['limit']]
+            
+            return results
         
         def command(self, cmd):
             return {'ok': 1}
@@ -586,14 +646,25 @@ def api_user_info():
         return jsonify({"message": "Not authenticated"}), 401
     
     # Get user info from database
-    user = mongo.db.users.find_one({"_id": ObjectId(session['user_id'])})
-    if not user:
-        return jsonify({"message": "User not found"}), 404
-    
-    return jsonify({
-        "username": user['username'],
-        "email": user['email']
-    }), 200
+    try:
+        # Try to convert to ObjectId if it's a valid MongoDB ObjectId
+        if session['user_id'].startswith('mock_'):
+            # Handle mock database IDs
+            user = mongo.db.users.find_one({"_id": session['user_id']})
+        else:
+            # Handle real MongoDB ObjectIds
+            user = mongo.db.users.find_one({"_id": ObjectId(session['user_id'])})
+        
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+        
+        return jsonify({
+            "username": user['username'],
+            "email": user['email']
+        }), 200
+    except Exception as e:
+        print(f"Error fetching user info: {e}")
+        return jsonify({"message": "Error fetching user info"}), 500
 
 @app.route('/api/analysis_history')
 def api_analysis_history():
@@ -657,8 +728,7 @@ def api_logout():
 def health_check():
     try:
         # Test database connection
-        db = client.get_database()
-        db.admin.command('ping')
+        mongo.db.command('ping')
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
